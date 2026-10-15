@@ -76,10 +76,19 @@ line. Harmless where no stall watcher runs; critical where one does.
 
 ## Install (needs approval + restart)
 
+Requires opencode v2.0+ (any 2.0.x server; verified on v2.0.29). Uses only
+core session/model APIs — no experimental hooks.
+
 **Quick method:** download the `dist` bundle from the latest
 [release](https://github.com/famewolf/opencode-handoff-v2/releases) into a
 folder (e.g. `~/.config/opencode-v2/opencode/plugins/handoff/`), register it
 (below), restart.
+
+One line (same thing, scripted):
+
+```sh
+mkdir -p ~/.config/opencode-v2/opencode/plugins/handoff && cd ~/.config/opencode-v2/opencode/plugins/handoff && for f in index.js plugin.js tools.js files.js vendor.js; do curl -sL -O https://github.com/famewolf/opencode-handoff-v2/releases/latest/download/$f; done
+```
 
 **Manual method:** clone the repo and point at the source (bun executes the
 root `index.ts` directly — see loader note):
@@ -92,6 +101,19 @@ Add `"file:///home/famewolf/opencode-handoff-v2"` to the `plugin`
 array in `~/.config/opencode-v2/opencode/opencode.jsonc`, then restart
 (config loads at startup). NOTE: the entry must sit outside
 `<config>/plugins/` (auto-discovery would double-load it).
+
+## Updating
+
+Re-download the `dist` bundle from the latest release over the installed
+copy and restart the server (manual installs: `git pull`, no rebuild needed
+for use — `dist/` is committed — rebuild only for development). There is no
+auto-update.
+
+## Uninstall
+
+Remove the plugin directory (or its files), delete the entry from
+`opencode.jsonc`, restart the server.
+
 
 ## Loader note (verified 2026-10-14)
 `file://` directory entries resolve root `index.ts` (bun executes TS
