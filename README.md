@@ -76,7 +76,19 @@ line. Harmless where no stall watcher runs; critical where one does.
 
 ## Install (needs approval + restart)
 
-Add `"file:///home/famewolf/opencode/opencode-handoff-v2"` to the `plugin`
+**Quick method:** download the `dist` bundle from the latest
+[release](https://github.com/famewolf/opencode-handoff-v2/releases) into a
+folder (e.g. `~/.config/opencode-v2/opencode/plugins/handoff/`), register it
+(below), restart.
+
+**Manual method:** clone the repo and point at the source (bun executes the
+root `index.ts` directly — see loader note):
+
+```sh
+git clone https://github.com/famewolf/opencode-handoff-v2.git
+```
+
+Add `"file:///home/famewolf/opencode-handoff-v2"` to the `plugin`
 array in `~/.config/opencode-v2/opencode/opencode.jsonc`, then restart
 (config loads at startup). NOTE: the entry must sit outside
 `<config>/plugins/` (auto-discovery would double-load it).
