@@ -4,3 +4,4 @@ node_modules/
 # node_modules/.bin/tsc is a local shim: devDependencies are declared in
 # package.json (typescript ~5.9.3) but node_modules here is a partial vendored
 # tree, so `bun run build` had no tsc. Run `bun install` for a real one.
+*.bak*
