@@ -31,17 +31,28 @@ function asStringArray(value) {
  * inherit. Verified against the live API 2026-10-15: session.create takes
  * {agent?, model?}, session.get returns {agent?, model?}, model.switch and
  * agent.switch are independent (neither resets the other), both 204.
+ * 2026-10-19: the catalogue arrives via listEntries — the SDK's list calls
+ * return { location, data }, not the bare array this comment once assumed.
  */
 function parseSelectionFlag(goal, name) {
-    const match = new RegExp(`--${name}\\s+("[^"]+"|'[^']+'|\\S+)`, "i").exec(goal);
+    const match = new RegExp(`--${name}\\s+("[^"]*"|'[^']*'|[^\\n]+)`, "i").exec(goal);
     if (!match)
         return undefined;
-    return match[1].replace(/^["']|["']$/g, "").trim() || undefined;
+    // A display name can contain spaces ("--model Big Pickle"), so the value runs
+    // to the end of the line rather than one token, stopping at a following
+    // --flag. (2026-10-19: taking a single token made `Big Pickle` resolve as
+    // `Big`, i.e. a real but wrong model.)
+    const value = match[1].replace(/[ \t]+--[A-Za-z][\w-]*(?=[ \t]|$)[\s\S]*$/, "").trim();
+    return value.replace(/^["']|["']$/g, "").trim() || undefined;
 }
 function stripSelectionFlags(goal) {
+    // Same line-scoped rule as parseSelectionFlag: strip the flag plus its whole
+    // value, stopping at the next flag. A single-token strip left the tail of a
+    // multi-word value behind ("--model Big Pickle" -> "Pickle" in the prompt).
     return goal
-        .replace(/--(?:model|agent)\s+("[^"]+"|'[^']+'|\S+)/gi, "")
+        .replace(/[ \t]*--(?:model|agent)[ \t]+("[^"]*"|'[^']*'|[^\n]*?)(?=[ \t]+--[A-Za-z][\w-]*(?=[ \t]|$)|[ \t]*$)/gim, "")
         .replace(/[ \t]{2,}/g, " ")
+        .replace(/[ \t]+$/gm, "")
         .trim();
 }
 function versionTuple(text) {
@@ -76,9 +87,40 @@ function rankCandidates(fragment, entries, namesOf) {
     scored.sort((a, b) => a.score - b.score);
     return scored.map((item) => item.entry);
 }
+/**
+ * Read the entries out of an SDK list payload.
+ *
+ * The plugin client's list() methods answer with an ENVELOPE, not a bare
+ * array: `ModelListOutput` / `AgentListOutput` = { location, data: [...] }
+ * (verified against @opencode/client 2.0.29 — `session.get` is unwrapped, the
+ * list calls are not). Feeding the envelope to the resolvers made
+ * `Array.isArray(listed)` false at every call site, so the catalogue arrived
+ * empty and each --model/--agent resolution silently kept the running model.
+ * Accept both shapes: today's envelope, and a bare array if an adapter ever
+ * unwraps it.
+ */
+function listEntries(value) {
+    const data = Array.isArray(value)
+        ? value
+        : value !== null && typeof value === "object"
+            ? value.data
+            : undefined;
+    if (!Array.isArray(data))
+        return [];
+    return data.filter((entry) => entry !== null && typeof entry === "object");
+}
 export function resolveModelFragment(fragment, models) {
     const usable = models.filter((entry) => typeof entry.id === "string" && typeof entry.providerID === "string");
-    const ranked = rankCandidates(fragment, usable, (entry) => [entry.id, typeof entry.name === "string" ? entry.name : ""].filter(Boolean));
+    // A provider-qualified fragment (`opencode/big-pickle`) — the form the model
+    // picker and `opencode models` print — narrows the pool to that provider
+    // first, so the qualifier is never compared against a bare id.
+    const slash = fragment.indexOf("/");
+    const providerHint = slash > 0 ? fragment.slice(0, slash).toLowerCase() : undefined;
+    const bare = providerHint === undefined ? fragment : fragment.slice(slash + 1);
+    const pool = providerHint === undefined ? usable : usable.filter((entry) => entry.providerID.toLowerCase() === providerHint);
+    if (pool.length === 0)
+        return undefined;
+    const ranked = rankCandidates(bare, pool, (entry) => [entry.id, typeof entry.name === "string" ? entry.name : ""].filter(Boolean));
     if (ranked.length === 0)
         return undefined;
     const best = ranked[0];
@@ -96,22 +138,63 @@ export function resolveAgentFragment(fragment, agents) {
     return ranked[0]?.name;
 }
 /**
- * Format a conversation transcript for display. Reads V2 message shapes
- * defensively (role/content with info/parts fallbacks).
+ * Normalize a message body into the part array the renderer walks, or
+ * undefined when there is nothing renderable.
+ *
+ * Three shapes occur in the wild (2026-10-18):
+ *   - `{content: [{type:"text",…}]}` / `{parts: […]}` — structured
+ *   - `{content: "text"}`                            — string body
+ *   - `{text: "text"}`                               — flat; this is what the live
+ *                                                      v2 session API actually returns
+ * The previous strict `Array.isArray(parts) → continue` matched only the first,
+ * so every real transcript rendered as a footer with no body at all.
  */
-function formatTranscript(messages, limit) {
+function normalizeParts(record) {
+    const raw = record["content"] ?? record["parts"];
+    if (typeof raw === "string")
+        return raw.length > 0 ? [{ type: "text", text: raw }] : undefined;
+    if (Array.isArray(raw)) {
+        const parts = raw.filter((part) => part !== null && typeof part === "object");
+        return parts.length > 0 ? parts : undefined;
+    }
+    if (typeof record["text"] === "string" && record["text"].length > 0) {
+        return [{ type: "text", text: record["text"] }];
+    }
+    return undefined;
+}
+/**
+ * Format a conversation transcript for display. Shape-tolerant (see
+ * normalizeParts), applies `limit` for real, and reports what it could not
+ * render instead of dropping messages silently.
+ */
+function formatTranscript(messages, limit, offset = 0) {
     if (!Array.isArray(messages) || messages.length === 0) {
         return "Session has no messages or does not exist.";
     }
+    // `offset` counts messages back from the NEWEST (0 = tail). Without it a
+    // fresh session could only ever read the end of a long transcript, which is
+    // backwards when the work happened early (2026-10-18).
+    const total = messages.length;
+    const off = Number.isFinite(offset) ? Math.max(0, Math.floor(offset)) : 0;
+    // An offset past the start clamps to the OLDEST `limit` messages rather than
+    // silently returning nothing.
+    const start = off >= total ? 0 : Math.max(0, total - off - limit);
+    const end = off >= total ? Math.min(total, limit) : total - off;
+    const shown = messages.slice(start, end);
     const lines = [];
-    for (const message of messages) {
-        if (message === null || typeof message !== "object")
+    let unreadable = 0;
+    for (const message of shown) {
+        if (message === null || typeof message !== "object") {
+            unreadable++;
             continue;
+        }
         const record = message;
         const role = record["role"] ?? record["info"]?.["role"];
-        const parts = record["content"] ?? record["parts"];
-        if (!Array.isArray(parts))
+        const parts = normalizeParts(record);
+        if (parts === undefined) {
+            unreadable++;
             continue;
+        }
         if (role === "user") {
             lines.push("## User");
             for (const part of parts) {
@@ -143,10 +226,18 @@ function formatTranscript(messages, limit) {
         }
     }
     const output = lines.join("\n").trim();
-    if (messages.length >= limit) {
-        return output + `\n\n(Showing ${messages.length} most recent messages. Use a higher 'limit' to see more.)`;
+    const notes = [];
+    if (unreadable > 0) {
+        notes.push(`(${unreadable} message(s) could not be rendered — unrecognized shape.)`);
     }
-    return output + `\n\n(End of session - ${messages.length} messages)`;
+    const footer = off > 0
+        ? start > 0
+            ? `(Showing ${shown.length} messages at offset ${off} of ${messages.length} — older messages remain. Lower 'offset' to page further back.)`
+            : `(Showing ${shown.length} messages at offset ${off} — start of history (${messages.length} total).)`
+        : shown.length < messages.length
+            ? `(Showing ${shown.length} of ${messages.length} most recent messages. Use a higher 'limit' to see more.)`
+            : `(End of session - ${messages.length} messages)`;
+    return [output, ...notes, footer].filter((part) => part.length > 0).join("\n\n");
 }
 export const handoffSessionInputSchema = {
     type: "object",
@@ -163,6 +254,10 @@ export const readSessionInputSchema = {
     properties: {
         sessionID: { ...STRING_SCHEMA, description: "The full session ID (e.g., ses_xxxxxxxxxxxxxxxx)" },
         limit: { type: "number", description: "Maximum number of messages to read (defaults to 100, max 500)" },
+        offset: {
+            type: "number",
+            description: "Messages to skip back from the NEWEST before reading (0 = default, reads the tail). Raise it to page toward the START of a long session — e.g. offset:100 reads the 100-to-125-newest window. Clamps at the start of history rather than returning nothing.",
+        },
     },
     required: ["sessionID"],
 };
@@ -206,8 +301,8 @@ export function makeHandoffSession(ctx) {
             let agentSource = currentAgent ? "inherited" : "default";
             if (modelFragment) {
                 try {
-                    const listed = (await ctx.model.list());
-                    const resolved = resolveModelFragment(modelFragment, Array.isArray(listed) ? listed : []);
+                    const listed = listEntries(await ctx.model.list());
+                    const resolved = resolveModelFragment(modelFragment, listed);
                     if (resolved) {
                         model = resolved;
                         modelSource = `matched --model ${modelFragment}`;
@@ -223,9 +318,8 @@ export function makeHandoffSession(ctx) {
             if (agentFragment) {
                 try {
                     const agentDomain = ctx.agent;
-                    const listed = typeof agentDomain?.list === "function" ? (await agentDomain.list()) : undefined;
-                    const names = Array.isArray(listed) ? listed : [];
-                    const resolved = resolveAgentFragment(agentFragment, names.filter((entry) => !!entry && typeof entry === "object"));
+                    const listed = typeof agentDomain?.list === "function" ? await agentDomain.list() : undefined;
+                    const resolved = resolveAgentFragment(agentFragment, listEntries(listed));
                     if (resolved) {
                         agent = resolved;
                         agentSource = `matched --agent ${agentFragment}`;
@@ -367,10 +461,11 @@ export function makeReadSession(ctx) {
             if (typeof input.sessionID !== "string" || input.sessionID.length === 0) {
                 return { content: "read_session requires a sessionID string." };
             }
-            const limit = Math.min(typeof input.limit === "number" ? input.limit : 100, 500);
+            const limit = Math.max(1, Math.min(typeof input.limit === "number" ? input.limit : 100, 500));
+            const offset = typeof input.offset === "number" && Number.isFinite(input.offset) ? input.offset : 0;
             try {
                 const messages = (await ctx.session.context({ sessionID: input.sessionID }));
-                return { content: formatTranscript(messages, limit) };
+                return { content: formatTranscript(messages, limit, offset) };
             }
             catch (error) {
                 return {

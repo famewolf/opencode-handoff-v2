@@ -19,6 +19,7 @@ interface HandoffSessionInput {
 interface ReadSessionInput {
     sessionID?: unknown;
     limit?: unknown;
+    offset?: unknown;
 }
 export declare function resolveModelFragment(fragment: string, models: Array<{
     id?: unknown;
@@ -35,23 +36,23 @@ export declare const handoffSessionInputSchema: {
     readonly type: "object";
     readonly properties: {
         readonly prompt: {
-            readonly type: "string";
             readonly description: "The generated handoff prompt";
+            readonly type: "string";
         };
         readonly files: {
+            readonly description: "Array of file paths to load into the new session's context";
             readonly type: "array";
             readonly items: {
                 readonly type: "string";
             };
-            readonly description: "Array of file paths to load into the new session's context";
         };
         readonly mode: {
-            readonly type: "string";
             readonly description: "quick: summary plus findings only, no file sections. full: everything (default)";
+            readonly type: "string";
         };
         readonly findings: {
-            readonly type: "string";
             readonly description: "Explicit findings file ref, overriding the most-recently-mentioned one";
+            readonly type: "string";
         };
     };
     readonly required: readonly ["prompt"];
@@ -60,12 +61,16 @@ export declare const readSessionInputSchema: {
     readonly type: "object";
     readonly properties: {
         readonly sessionID: {
-            readonly type: "string";
             readonly description: "The full session ID (e.g., ses_xxxxxxxxxxxxxxxx)";
+            readonly type: "string";
         };
         readonly limit: {
             readonly type: "number";
             readonly description: "Maximum number of messages to read (defaults to 100, max 500)";
+        };
+        readonly offset: {
+            readonly type: "number";
+            readonly description: "Messages to skip back from the NEWEST before reading (0 = default, reads the tail). Raise it to page toward the START of a long session — e.g. offset:100 reads the 100-to-125-newest window. Clamps at the start of history rather than returning nothing.";
         };
     };
     readonly required: readonly ["sessionID"];
@@ -82,23 +87,23 @@ export declare function makeHandoffSession(ctx: Context): {
         readonly type: "object";
         readonly properties: {
             readonly prompt: {
-                readonly type: "string";
                 readonly description: "The generated handoff prompt";
+                readonly type: "string";
             };
             readonly files: {
+                readonly description: "Array of file paths to load into the new session's context";
                 readonly type: "array";
                 readonly items: {
                     readonly type: "string";
                 };
-                readonly description: "Array of file paths to load into the new session's context";
             };
             readonly mode: {
-                readonly type: "string";
                 readonly description: "quick: summary plus findings only, no file sections. full: everything (default)";
+                readonly type: "string";
             };
             readonly findings: {
-                readonly type: "string";
                 readonly description: "Explicit findings file ref, overriding the most-recently-mentioned one";
+                readonly type: "string";
             };
         };
         readonly required: readonly ["prompt"];
@@ -120,12 +125,16 @@ export declare function makeReadSession(ctx: Context): {
         readonly type: "object";
         readonly properties: {
             readonly sessionID: {
-                readonly type: "string";
                 readonly description: "The full session ID (e.g., ses_xxxxxxxxxxxxxxxx)";
+                readonly type: "string";
             };
             readonly limit: {
                 readonly type: "number";
                 readonly description: "Maximum number of messages to read (defaults to 100, max 500)";
+            };
+            readonly offset: {
+                readonly type: "number";
+                readonly description: "Messages to skip back from the NEWEST before reading (0 = default, reads the tail). Raise it to page toward the START of a long session — e.g. offset:100 reads the 100-to-125-newest window. Clamps at the start of history rather than returning nothing.";
             };
         };
         readonly required: readonly ["sessionID"];
