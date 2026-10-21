@@ -15,6 +15,8 @@ interface HandoffSessionInput {
     files?: unknown;
     mode?: unknown;
     findings?: unknown;
+    model?: unknown;
+    agent?: unknown;
 }
 interface ReadSessionInput {
     sessionID?: unknown;
@@ -52,6 +54,14 @@ export declare const handoffSessionInputSchema: {
         };
         readonly findings: {
             readonly description: "Explicit findings file ref, overriding the most-recently-mentioned one";
+            readonly type: "string";
+        };
+        readonly model: {
+            readonly description: "Model for the new session (id, display name, or provider/id). Used when the handoff goal carries no --model flag; the goal always wins over this argument.";
+            readonly type: "string";
+        };
+        readonly agent: {
+            readonly description: "Agent for the new session. Used when the handoff goal carries no --agent flag; the goal always wins over this argument.";
             readonly type: "string";
         };
     };
@@ -103,6 +113,14 @@ export declare function makeHandoffSession(ctx: Context): {
             };
             readonly findings: {
                 readonly description: "Explicit findings file ref, overriding the most-recently-mentioned one";
+                readonly type: "string";
+            };
+            readonly model: {
+                readonly description: "Model for the new session (id, display name, or provider/id). Used when the handoff goal carries no --model flag; the goal always wins over this argument.";
+                readonly type: "string";
+            };
+            readonly agent: {
+                readonly description: "Agent for the new session. Used when the handoff goal carries no --agent flag; the goal always wins over this argument.";
                 readonly type: "string";
             };
         };

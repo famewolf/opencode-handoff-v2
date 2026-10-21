@@ -18,6 +18,7 @@
 
 import type { Plugin } from "@opencode/plugin"
 import { FINDINGS_ROOT, MAX_FINDINGS_FILES } from "./files.js"
+import { recordGoal } from "./selection.js"
 import { makeHandoffSession, makeReadSession } from "./tools.js"
 
 const HANDOFF_COMMAND = `GOAL: You are creating a handoff message to continue work in a new session.
@@ -56,13 +57,9 @@ Analyze this conversation and extract what matters for continuing the work.
 
    This box keeps per-task findings in ${FINDINGS_ROOT} (files matching *findings*.md). Mention the one findings file the next session needs as an @-ref (e.g. @${FINDINGS_ROOT}/todo_plugin_findings.md). The handoff tool attaches the most recently mentioned one — a single file, never a batch. To override recency, pass it explicitly via the tool's findings parameter. If none fits, say so explicitly and none is attached.
 
-Mode: if the user's goal contains --quick, call handoff_session with mode "quick" (summary plus findings only, file contents omitted). Otherwise use the default full mode.
+Mode: if the user's goal contains --quick, pass mode "quick" to the tool (summary plus findings only, file contents omitted). Otherwise use the default full mode.
 
-Model/agent: the goal text may carry --model <fragment> and/or --agent <fragment> (case-insensitive, partial values ok, e.g. --model muse). The tool resolves them against the live catalog (exact, then prefix, then substring; model ties prefer the highest numeric version) and applies the pair to the new session. No flags means the new session inherits the current session's agent and model. Flags are consumed, not posted.
-
-3. Name the session findings file
-
-   This box keeps per-task findings in ${FINDINGS_ROOT} (files matching *findings*.md). Mention the one findings file the next session needs as an @-ref (e.g. @${FINDINGS_ROOT}/todo_plugin_findings.md). The handoff tool attaches the most recently mentioned one — a single file, never a batch. If none fits, say so explicitly and none is attached.
+Model/agent: the tool picks the new session's model and agent from the GOAL you were given — it reads the \`--model\` and \`--agent\` flags straight out of it (case-insensitive, partial values ok, e.g. \`--model muse\`), resolves them against the live catalog (exact, then prefix, then substring; model ties prefer the highest numeric version) and applies the pair to the new session. Do not copy those flags into the prompt you write and do not pass them yourself: the goal is the source of truth, and a flag that appears only in your rewritten prompt is used only when the goal carries none. No flags in the goal means the new session inherits the current session's agent and model. Flags are consumed, not posted.
 
 The user controls what context matters. If they mentioned something to preserve, include it—trust their judgment about their workflow.
 
@@ -85,8 +82,11 @@ USER: $ARGUMENTS
 
 ---
 
-After generating the handoff message, IMMEDIATELY call handoff_session with your prompt and files:
-\`handoff_session(prompt="...", files=["src/foo.ts", "src/bar.ts", ...])\`
+After generating the handoff message, call the handoff_session tool THROUGH the Code Mode \`execute\` tool. Plugin tools are NOT in the top-level tool list — a direct handoff_session(...) call fails with "No tool named handoff_session is currently available".
+
+  execute({ code: \`return await tools.handoff_session({ prompt: "<the handoff message>", files: ["src/foo.ts", "src/bar.ts"] })\` })
+
+Write the handoff message into that code as a properly quoted JSON string. Pass the findings parameter only to override the findings file; otherwise let the tool attach the most recently mentioned one.
 `
 
 function goalFromPrompt(prompt: unknown): string {
@@ -105,6 +105,11 @@ export const HandoffV2Plugin: Plugin.Plugin = {
         description: "Create a focused handoff prompt for a new session (prompt + findings + files travel along)",
         execute: async ({ sessionID, prompt, delivery }) => {
           const goal = goalFromPrompt(prompt).trim()
+          // Capture the user's own text before the model can rewrite it: the
+          // --model/--agent flags travel from here to the tool, and a rewrite
+          // that dropped them used to downgrade the handoff to the running
+          // model with no error (2026-10-21).
+          recordGoal(sessionID, goal)
           const text = HANDOFF_COMMAND.replace(
             "USER: $ARGUMENTS",
             `USER: ${goal.length > 0 ? goal : "(no goal given — capture a natural continuation)"}`,

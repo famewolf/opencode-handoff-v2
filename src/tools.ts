@@ -12,6 +12,7 @@
 import * as fs from "node:fs/promises"
 import type { Plugin } from "@opencode/plugin"
 import { FINDINGS_ROOT, FINDINGS_INLINE_BYTES, HANDOFF_BUDGET_BYTES, buildFileSections, collectWorkingTree, parseFileReferences, resolveSessionFindings } from "./files.js"
+import { cachedGoal, clearGoal, findGoalInMessages, pickSelection, selectFromGoal, stripSelectionFlags, type Selection } from "./selection.js"
 
 type Context = Plugin.Context
 
@@ -26,6 +27,8 @@ interface HandoffSessionInput {
   files?: unknown
   mode?: unknown
   findings?: unknown
+  model?: unknown
+  agent?: unknown
 }
 
 interface ReadSessionInput {
@@ -39,41 +42,16 @@ function asStringArray(value: unknown): Array<string> {
   return value.filter((entry): entry is string => typeof entry === "string")
 }
 
-/**
- * Model/agent selection for the new session, from the /handoff goal text.
- *
- * Flags (case-insensitive, partial values ok): `--model <fragment>`,
- * `--agent <fragment>`. Resolution, in order: exact id/name match, then
- * prefix, then substring; model ties break toward the highest numeric
- * version (1.10 beats 1.9); a final tie — or anything unreadable — falls
- * back to inheriting the current session and says so. No flag means
- * inherit. Verified against the live API 2026-10-15: session.create takes
- * {agent?, model?}, session.get returns {agent?, model?}, model.switch and
- * agent.switch are independent (neither resets the other), both 204.
- * 2026-10-19: the catalogue arrives via listEntries — the SDK's list calls
- * return { location, data }, not the bare array this comment once assumed.
- */
-function parseSelectionFlag(goal: string, name: "model" | "agent"): string | undefined {
-  const match = new RegExp(`--${name}\\s+("[^"]*"|'[^']*'|[^\\n]+)`, "i").exec(goal)
-  if (!match) return undefined
-  // A display name can contain spaces ("--model Big Pickle"), so the value runs
-  // to the end of the line rather than one token, stopping at a following
-  // --flag. (2026-10-19: taking a single token made `Big Pickle` resolve as
-  // `Big`, i.e. a real but wrong model.)
-  const value = match[1]!.replace(/[ \t]+--[A-Za-z][\w-]*(?=[ \t]|$)[\s\S]*$/, "").trim()
-  return value.replace(/^["']|["']$/g, "").trim() || undefined
+function asTrimmedString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
 }
 
-function stripSelectionFlags(goal: string): string {
-  // Same line-scoped rule as parseSelectionFlag: strip the flag plus its whole
-  // value, stopping at the next flag. A single-token strip left the tail of a
-  // multi-word value behind ("--model Big Pickle" -> "Pickle" in the prompt).
-  return goal
-    .replace(/[ \t]*--(?:model|agent)[ \t]+("[^"]*"|'[^']*'|[^\n]*?)(?=[ \t]+--[A-Za-z][\w-]*(?=[ \t]|$)|[ \t]*$)/gim, "")
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/[ \t]+$/gm, "")
-    .trim()
-}
+/**
+ * Flag parsing lives in ./selection.ts — the /handoff command needs it too, to
+ * capture the user's goal before the model can rewrite it.
+ */
 
 function versionTuple(text: string): Array<number> {
   const match = text.match(/\d+(?:\.\d+)*/)
@@ -276,6 +254,16 @@ export const handoffSessionInputSchema = {
     files: { ...OPTIONAL_STRING_ARRAY_SCHEMA, description: "Array of file paths to load into the new session's context" },
     mode: { ...STRING_SCHEMA, description: "quick: summary plus findings only, no file sections. full: everything (default)" },
     findings: { ...STRING_SCHEMA, description: "Explicit findings file ref, overriding the most-recently-mentioned one" },
+    model: {
+      ...STRING_SCHEMA,
+      description:
+        "Model for the new session (id, display name, or provider/id). Used when the handoff goal carries no --model flag; the goal always wins over this argument.",
+    },
+    agent: {
+      ...STRING_SCHEMA,
+      description:
+        "Agent for the new session. Used when the handoff goal carries no --agent flag; the goal always wins over this argument.",
+    },
   },
   required: ["prompt"],
 } as const
@@ -294,6 +282,21 @@ export const readSessionInputSchema = {
   required: ["sessionID"],
 } as const
 
+/** Read a session transcript; unreadable is not fatal — the handoff continues. */
+async function readSessionMessages(ctx: Context, sessionID: string): Promise<ReadonlyArray<unknown> | undefined> {
+  try {
+    return (await ctx.session.context({ sessionID })) as ReadonlyArray<unknown> | undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Describe where the selected model/agent came from, for the result line. */
+function describeSelection(kind: "model" | "agent", selection: Selection): string {
+  if (selection.origin === "argument") return `matched ${kind} ${selection.fragment} (explicit argument)`
+  return `matched --${kind} ${selection.fragment} (${selection.origin})`
+}
+
 /**
  * Create the handoff_session tool: builds the full prompt (session
  * reference + findings + file sections + model prompt), creates a new
@@ -311,11 +314,20 @@ export function makeHandoffSession(ctx: Context) {
       const quick = input.mode === "quick"
       const explicitFindings = typeof input.findings === "string" && input.findings.length > 0 ? input.findings : undefined
 
-      // Model/agent for the new session: explicit --model/--agent flags win,
-      // otherwise inherit the current session. Every step degrades to
-      // omit-and-continue — a failed resolution must never fail the handoff.
-      const modelFragment = parseSelectionFlag(prompt, "model")
-      const agentFragment = parseSelectionFlag(prompt, "agent")
+      // Model/agent for the new session. Precedence: the GOAL (the user's own
+      // words, captured when /handoff ran) > an explicit tool argument > the
+      // model-authored prompt. The goal outranks the prompt because a rewrite
+      // that dropped the flag used to look exactly like "no flag" — the
+      // handoff then ran on the current model instead of the requested one,
+      // with no error (2026-10-21). Every step degrades to omit-and-continue
+      // — a failed resolution must never fail the handoff.
+      const sessionMessages = await readSessionMessages(ctx, context.sessionID)
+      const cached = cachedGoal(context.sessionID)
+      const goalText = cached !== undefined ? cached : findGoalInMessages(sessionMessages)
+      const goalFlags = selectFromGoal(goalText ?? "")
+      const promptFlags = selectFromGoal(prompt)
+      const modelSelection = pickSelection(goalFlags.model, asTrimmedString(input.model), promptFlags.model)
+      const agentSelection = pickSelection(goalFlags.agent, asTrimmedString(input.agent), promptFlags.agent)
       let currentAgent: string | undefined
       let currentModel: { providerID: string; id: string } | undefined
       try {
@@ -334,30 +346,30 @@ export function makeHandoffSession(ctx: Context) {
       let modelSource = currentModel ? "inherited" : "default"
       let agent: string | undefined = currentAgent
       let agentSource = currentAgent ? "inherited" : "default"
-      if (modelFragment) {
+      if (modelSelection) {
         try {
           const listed = listEntries<{ id?: unknown; name?: unknown; providerID?: unknown }>(await ctx.model.list())
-          const resolved = resolveModelFragment(modelFragment, listed)
+          const resolved = resolveModelFragment(modelSelection.fragment, listed)
           if (resolved) {
             model = resolved
-            modelSource = `matched --model ${modelFragment}`
+            modelSource = describeSelection("model", modelSelection)
           } else {
-            modelSource = `--model ${modelFragment} matched nothing, kept ${currentModel ? "current" : "default"}`
+            modelSource = `--model ${modelSelection.fragment} matched nothing, kept ${currentModel ? "current" : "default"} (${modelSelection.origin})`
           }
         } catch {
           modelSource = `model list unreadable, kept ${currentModel ? "current" : "default"}`
         }
       }
-      if (agentFragment) {
+      if (agentSelection) {
         try {
           const agentDomain = (ctx as unknown as { agent?: { list?: () => unknown } }).agent
           const listed = typeof agentDomain?.list === "function" ? await agentDomain.list() : undefined
-          const resolved = resolveAgentFragment(agentFragment, listEntries<{ name?: unknown }>(listed))
+          const resolved = resolveAgentFragment(agentSelection.fragment, listEntries<{ name?: unknown }>(listed))
           if (resolved) {
             agent = resolved
-            agentSource = `matched --agent ${agentFragment}`
+            agentSource = describeSelection("agent", agentSelection)
           } else {
-            agentSource = `--agent ${agentFragment} matched nothing, kept ${currentAgent ? "current" : "default"}`
+            agentSource = `--agent ${agentSelection.fragment} matched nothing, kept ${currentAgent ? "current" : "default"} (${agentSelection.origin})`
           }
         } catch {
           agentSource = `agent list unreadable, kept ${currentAgent ? "current" : "default"}`
@@ -377,9 +389,7 @@ export function makeHandoffSession(ctx: Context) {
 
       let findingsRef = explicitFindings
       if (findingsRef === undefined) {
-        findingsRef = await resolveSessionFindings(
-          (await ctx.session.context({ sessionID: context.sessionID })) as ReadonlyArray<unknown> | undefined,
-        )
+        findingsRef = await resolveSessionFindings(sessionMessages)
       }
       const findingsSections: Array<string> = []
       const findingsNamedOnly: Array<string> = []
@@ -476,6 +486,9 @@ export function makeHandoffSession(ctx: Context) {
         // Verification is best-effort; the posted prompt is the handoff.
       }
       await ctx.session.prompt({ sessionID, text: fullPrompt } as never)
+      // The captured goal has served its purpose: drop it, so a later direct
+      // call in this session does not inherit a stale flag.
+      if (cached !== undefined) clearGoal(context.sessionID)
 
       const modelNote = model ? `${model.providerID}/${model.id} (${modelSource})` : "server default"
       const agentNote = agent ? `${agent} (${agentSource})` : "server default"
