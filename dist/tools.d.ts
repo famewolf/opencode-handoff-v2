@@ -31,7 +31,18 @@ export declare function resolveModelFragment(fragment: string, models: Array<{
     providerID: string;
     id: string;
 } | undefined;
+/**
+ * Resolve an agent fragment to the agent's runtime key.
+ *
+ * The server keys agents by ID (`Agent.ID.make(id)`, `agents.get(id)` in
+ * core/src/agent.ts) and a session carrying a non-key throws
+ * `AgentNotFoundError` when it loads its context (core/src/session/context.ts).
+ * The catalogue exposes both: `id` is the key ("build"), `name` is the display
+ * name ("Build"). So the display name may be MATCHED — users type either — but
+ * the ID is what gets returned and what the session is created with.
+ */
 export declare function resolveAgentFragment(fragment: string, agents: Array<{
+    id?: unknown;
     name?: unknown;
 }>): string | undefined;
 export declare const handoffSessionInputSchema: {

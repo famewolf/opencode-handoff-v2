@@ -134,13 +134,34 @@ export function resolveModelFragment(
   return { providerID: winner.providerID, id: winner.id }
 }
 
+/**
+ * Resolve an agent fragment to the agent's runtime key.
+ *
+ * The server keys agents by ID (`Agent.ID.make(id)`, `agents.get(id)` in
+ * core/src/agent.ts) and a session carrying a non-key throws
+ * `AgentNotFoundError` when it loads its context (core/src/session/context.ts).
+ * The catalogue exposes both: `id` is the key ("build"), `name` is the display
+ * name ("Build"). So the display name may be MATCHED — users type either — but
+ * the ID is what gets returned and what the session is created with.
+ */
 export function resolveAgentFragment(
   fragment: string,
-  agents: Array<{ name?: unknown }>,
+  agents: Array<{ id?: unknown; name?: unknown }>,
 ): string | undefined {
-  const usable = agents.filter((entry): entry is { name: string } => typeof entry.name === "string")
-  const ranked = rankCandidates(fragment, usable, (entry) => [entry.name])
-  return ranked[0]?.name
+  const usable = agents.filter(
+    (entry): entry is { id?: string; name?: string } =>
+      typeof entry.id === "string" || typeof entry.name === "string",
+  )
+  const ranked = rankCandidates(
+    fragment,
+    usable,
+    (entry) => [typeof entry.id === "string" ? entry.id : "", typeof entry.name === "string" ? entry.name : ""].filter(
+      (value) => value.length > 0,
+    ),
+  )
+  const winner = ranked[0]
+  if (!winner) return undefined
+  return winner.id ?? winner.name
 }
 
 /**
@@ -364,7 +385,7 @@ export function makeHandoffSession(ctx: Context) {
         try {
           const agentDomain = (ctx as unknown as { agent?: { list?: () => unknown } }).agent
           const listed = typeof agentDomain?.list === "function" ? await agentDomain.list() : undefined
-          const resolved = resolveAgentFragment(agentSelection.fragment, listEntries<{ name?: unknown }>(listed))
+          const resolved = resolveAgentFragment(agentSelection.fragment, listEntries<{ id?: unknown; name?: unknown }>(listed))
           if (resolved) {
             agent = resolved
             agentSource = describeSelection("agent", agentSelection)

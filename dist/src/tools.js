@@ -10,6 +10,7 @@
  */
 import * as fs from "node:fs/promises";
 import { FINDINGS_ROOT, FINDINGS_INLINE_BYTES, HANDOFF_BUDGET_BYTES, buildFileSections, collectWorkingTree, parseFileReferences, resolveSessionFindings } from "./files.js";
+import { cachedGoal, clearGoal, findGoalInMessages, pickSelection, selectFromGoal, stripSelectionFlags } from "./selection.js";
 const STRING_SCHEMA = { type: "string" };
 const OPTIONAL_STRING_ARRAY_SCHEMA = {
     type: "array",
@@ -20,23 +21,169 @@ function asStringArray(value) {
         return [];
     return value.filter((entry) => typeof entry === "string");
 }
+function asTrimmedString(value) {
+    if (typeof value !== "string")
+        return undefined;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+}
 /**
- * Format a conversation transcript for display. Reads V2 message shapes
- * defensively (role/content with info/parts fallbacks).
+ * Flag parsing lives in ./selection.ts — the /handoff command needs it too, to
+ * capture the user's goal before the model can rewrite it.
  */
-function formatTranscript(messages, limit) {
+function versionTuple(text) {
+    const match = text.match(/\d+(?:\.\d+)*/);
+    if (!match)
+        return [];
+    return match[0].split(".").map((part) => Number.parseInt(part, 10));
+}
+function compareVersions(a, b) {
+    const va = versionTuple(a);
+    const vb = versionTuple(b);
+    for (let index = 0; index < Math.max(va.length, vb.length); index++) {
+        const diff = (va[index] ?? 0) - (vb[index] ?? 0);
+        if (diff !== 0)
+            return diff;
+    }
+    return 0;
+}
+/** Ranked candidates for a case-insensitive fragment: exact > prefix > substring. */
+function rankCandidates(fragment, entries, namesOf) {
+    const lowered = fragment.toLowerCase();
+    const scored = [];
+    for (const entry of entries) {
+        const names = namesOf(entry).map((name) => name.toLowerCase());
+        if (names.some((name) => name === lowered))
+            scored.push({ entry, score: 0 });
+        else if (names.some((name) => name.startsWith(lowered)))
+            scored.push({ entry, score: 1 });
+        else if (names.some((name) => name.includes(lowered)))
+            scored.push({ entry, score: 2 });
+    }
+    scored.sort((a, b) => a.score - b.score);
+    return scored.map((item) => item.entry);
+}
+/**
+ * Read the entries out of an SDK list payload.
+ *
+ * The plugin client's list() methods answer with an ENVELOPE, not a bare
+ * array: `ModelListOutput` / `AgentListOutput` = { location, data: [...] }
+ * (verified against @opencode/client 2.0.29 — `session.get` is unwrapped, the
+ * list calls are not). Feeding the envelope to the resolvers made
+ * `Array.isArray(listed)` false at every call site, so the catalogue arrived
+ * empty and each --model/--agent resolution silently kept the running model.
+ * Accept both shapes: today's envelope, and a bare array if an adapter ever
+ * unwraps it.
+ */
+function listEntries(value) {
+    const data = Array.isArray(value)
+        ? value
+        : value !== null && typeof value === "object"
+            ? value.data
+            : undefined;
+    if (!Array.isArray(data))
+        return [];
+    return data.filter((entry) => entry !== null && typeof entry === "object");
+}
+export function resolveModelFragment(fragment, models) {
+    const usable = models.filter((entry) => typeof entry.id === "string" && typeof entry.providerID === "string");
+    // A provider-qualified fragment (`opencode/big-pickle`) — the form the model
+    // picker and `opencode models` print — narrows the pool to that provider
+    // first, so the qualifier is never compared against a bare id.
+    const slash = fragment.indexOf("/");
+    const providerHint = slash > 0 ? fragment.slice(0, slash).toLowerCase() : undefined;
+    const bare = providerHint === undefined ? fragment : fragment.slice(slash + 1);
+    const pool = providerHint === undefined ? usable : usable.filter((entry) => entry.providerID.toLowerCase() === providerHint);
+    if (pool.length === 0)
+        return undefined;
+    const ranked = rankCandidates(bare, pool, (entry) => [entry.id, typeof entry.name === "string" ? entry.name : ""].filter(Boolean));
+    if (ranked.length === 0)
+        return undefined;
+    const best = ranked[0];
+    const tied = ranked.filter((entry) => entry.id.toLowerCase() === best.id.toLowerCase() || entry.id.startsWith(best.id) || best.id.startsWith(entry.id));
+    let winner = best;
+    for (const entry of tied) {
+        if (compareVersions(entry.id, winner.id) > 0)
+            winner = entry;
+    }
+    return { providerID: winner.providerID, id: winner.id };
+}
+/**
+ * Resolve an agent fragment to the agent's runtime key.
+ *
+ * The server keys agents by ID (`Agent.ID.make(id)`, `agents.get(id)` in
+ * core/src/agent.ts) and a session carrying a non-key throws
+ * `AgentNotFoundError` when it loads its context (core/src/session/context.ts).
+ * The catalogue exposes both: `id` is the key ("build"), `name` is the display
+ * name ("Build"). So the display name may be MATCHED — users type either — but
+ * the ID is what gets returned and what the session is created with.
+ */
+export function resolveAgentFragment(fragment, agents) {
+    const usable = agents.filter((entry) => typeof entry.id === "string" || typeof entry.name === "string");
+    const ranked = rankCandidates(fragment, usable, (entry) => [typeof entry.id === "string" ? entry.id : "", typeof entry.name === "string" ? entry.name : ""].filter((value) => value.length > 0));
+    const winner = ranked[0];
+    if (!winner)
+        return undefined;
+    return winner.id ?? winner.name;
+}
+/**
+ * Normalize a message body into the part array the renderer walks, or
+ * undefined when there is nothing renderable.
+ *
+ * Three shapes occur in the wild (2026-10-18):
+ *   - `{content: [{type:"text",…}]}` / `{parts: […]}` — structured
+ *   - `{content: "text"}`                            — string body
+ *   - `{text: "text"}`                               — flat; this is what the live
+ *                                                      v2 session API actually returns
+ * The previous strict `Array.isArray(parts) → continue` matched only the first,
+ * so every real transcript rendered as a footer with no body at all.
+ */
+function normalizeParts(record) {
+    const raw = record["content"] ?? record["parts"];
+    if (typeof raw === "string")
+        return raw.length > 0 ? [{ type: "text", text: raw }] : undefined;
+    if (Array.isArray(raw)) {
+        const parts = raw.filter((part) => part !== null && typeof part === "object");
+        return parts.length > 0 ? parts : undefined;
+    }
+    if (typeof record["text"] === "string" && record["text"].length > 0) {
+        return [{ type: "text", text: record["text"] }];
+    }
+    return undefined;
+}
+/**
+ * Format a conversation transcript for display. Shape-tolerant (see
+ * normalizeParts), applies `limit` for real, and reports what it could not
+ * render instead of dropping messages silently.
+ */
+function formatTranscript(messages, limit, offset = 0) {
     if (!Array.isArray(messages) || messages.length === 0) {
         return "Session has no messages or does not exist.";
     }
+    // `offset` counts messages back from the NEWEST (0 = tail). Without it a
+    // fresh session could only ever read the end of a long transcript, which is
+    // backwards when the work happened early (2026-10-18).
+    const total = messages.length;
+    const off = Number.isFinite(offset) ? Math.max(0, Math.floor(offset)) : 0;
+    // An offset past the start clamps to the OLDEST `limit` messages rather than
+    // silently returning nothing.
+    const start = off >= total ? 0 : Math.max(0, total - off - limit);
+    const end = off >= total ? Math.min(total, limit) : total - off;
+    const shown = messages.slice(start, end);
     const lines = [];
-    for (const message of messages) {
-        if (message === null || typeof message !== "object")
+    let unreadable = 0;
+    for (const message of shown) {
+        if (message === null || typeof message !== "object") {
+            unreadable++;
             continue;
+        }
         const record = message;
         const role = record["role"] ?? record["info"]?.["role"];
-        const parts = record["content"] ?? record["parts"];
-        if (!Array.isArray(parts))
+        const parts = normalizeParts(record);
+        if (parts === undefined) {
+            unreadable++;
             continue;
+        }
         if (role === "user") {
             lines.push("## User");
             for (const part of parts) {
@@ -68,10 +215,18 @@ function formatTranscript(messages, limit) {
         }
     }
     const output = lines.join("\n").trim();
-    if (messages.length >= limit) {
-        return output + `\n\n(Showing ${messages.length} most recent messages. Use a higher 'limit' to see more.)`;
+    const notes = [];
+    if (unreadable > 0) {
+        notes.push(`(${unreadable} message(s) could not be rendered — unrecognized shape.)`);
     }
-    return output + `\n\n(End of session - ${messages.length} messages)`;
+    const footer = off > 0
+        ? start > 0
+            ? `(Showing ${shown.length} messages at offset ${off} of ${messages.length} — older messages remain. Lower 'offset' to page further back.)`
+            : `(Showing ${shown.length} messages at offset ${off} — start of history (${messages.length} total).)`
+        : shown.length < messages.length
+            ? `(Showing ${shown.length} of ${messages.length} most recent messages. Use a higher 'limit' to see more.)`
+            : `(End of session - ${messages.length} messages)`;
+    return [output, ...notes, footer].filter((part) => part.length > 0).join("\n\n");
 }
 export const handoffSessionInputSchema = {
     type: "object",
@@ -80,6 +235,14 @@ export const handoffSessionInputSchema = {
         files: { ...OPTIONAL_STRING_ARRAY_SCHEMA, description: "Array of file paths to load into the new session's context" },
         mode: { ...STRING_SCHEMA, description: "quick: summary plus findings only, no file sections. full: everything (default)" },
         findings: { ...STRING_SCHEMA, description: "Explicit findings file ref, overriding the most-recently-mentioned one" },
+        model: {
+            ...STRING_SCHEMA,
+            description: "Model for the new session (id, display name, or provider/id). Used when the handoff goal carries no --model flag; the goal always wins over this argument.",
+        },
+        agent: {
+            ...STRING_SCHEMA,
+            description: "Agent for the new session. Used when the handoff goal carries no --agent flag; the goal always wins over this argument.",
+        },
     },
     required: ["prompt"],
 };
@@ -88,9 +251,28 @@ export const readSessionInputSchema = {
     properties: {
         sessionID: { ...STRING_SCHEMA, description: "The full session ID (e.g., ses_xxxxxxxxxxxxxxxx)" },
         limit: { type: "number", description: "Maximum number of messages to read (defaults to 100, max 500)" },
+        offset: {
+            type: "number",
+            description: "Messages to skip back from the NEWEST before reading (0 = default, reads the tail). Raise it to page toward the START of a long session — e.g. offset:100 reads the 100-to-125-newest window. Clamps at the start of history rather than returning nothing.",
+        },
     },
     required: ["sessionID"],
 };
+/** Read a session transcript; unreadable is not fatal — the handoff continues. */
+async function readSessionMessages(ctx, sessionID) {
+    try {
+        return (await ctx.session.context({ sessionID }));
+    }
+    catch {
+        return undefined;
+    }
+}
+/** Describe where the selected model/agent came from, for the result line. */
+function describeSelection(kind, selection) {
+    if (selection.origin === "argument")
+        return `matched ${kind} ${selection.fragment} (explicit argument)`;
+    return `matched --${kind} ${selection.fragment} (${selection.origin})`;
+}
 /**
  * Create the handoff_session tool: builds the full prompt (session
  * reference + findings + file sections + model prompt), creates a new
@@ -107,16 +289,81 @@ export function makeHandoffSession(ctx) {
             const directory = ctx.location.directory;
             const quick = input.mode === "quick";
             const explicitFindings = typeof input.findings === "string" && input.findings.length > 0 ? input.findings : undefined;
+            // Model/agent for the new session. Precedence: the GOAL (the user's own
+            // words, captured when /handoff ran) > an explicit tool argument > the
+            // model-authored prompt. The goal outranks the prompt because a rewrite
+            // that dropped the flag used to look exactly like "no flag" — the
+            // handoff then ran on the current model instead of the requested one,
+            // with no error (2026-10-21). Every step degrades to omit-and-continue
+            // — a failed resolution must never fail the handoff.
+            const sessionMessages = await readSessionMessages(ctx, context.sessionID);
+            const cached = cachedGoal(context.sessionID);
+            const goalText = cached !== undefined ? cached : findGoalInMessages(sessionMessages);
+            const goalFlags = selectFromGoal(goalText ?? "");
+            const promptFlags = selectFromGoal(prompt);
+            const modelSelection = pickSelection(goalFlags.model, asTrimmedString(input.model), promptFlags.model);
+            const agentSelection = pickSelection(goalFlags.agent, asTrimmedString(input.agent), promptFlags.agent);
+            let currentAgent;
+            let currentModel;
+            try {
+                const info = (await ctx.session.get({ sessionID: context.sessionID }));
+                if (typeof info?.agent === "string")
+                    currentAgent = info.agent;
+                if (typeof info?.model?.providerID === "string" && typeof info?.model?.id === "string") {
+                    currentModel = { providerID: info.model.providerID, id: info.model.id };
+                }
+            }
+            catch {
+                // Current pair unreadable — explicit flags can still resolve.
+            }
+            let model = currentModel;
+            let modelSource = currentModel ? "inherited" : "default";
+            let agent = currentAgent;
+            let agentSource = currentAgent ? "inherited" : "default";
+            if (modelSelection) {
+                try {
+                    const listed = listEntries(await ctx.model.list());
+                    const resolved = resolveModelFragment(modelSelection.fragment, listed);
+                    if (resolved) {
+                        model = resolved;
+                        modelSource = describeSelection("model", modelSelection);
+                    }
+                    else {
+                        modelSource = `--model ${modelSelection.fragment} matched nothing, kept ${currentModel ? "current" : "default"} (${modelSelection.origin})`;
+                    }
+                }
+                catch {
+                    modelSource = `model list unreadable, kept ${currentModel ? "current" : "default"}`;
+                }
+            }
+            if (agentSelection) {
+                try {
+                    const agentDomain = ctx.agent;
+                    const listed = typeof agentDomain?.list === "function" ? await agentDomain.list() : undefined;
+                    const resolved = resolveAgentFragment(agentSelection.fragment, listEntries(listed));
+                    if (resolved) {
+                        agent = resolved;
+                        agentSource = describeSelection("agent", agentSelection);
+                    }
+                    else {
+                        agentSource = `--agent ${agentSelection.fragment} matched nothing, kept ${currentAgent ? "current" : "default"} (${agentSelection.origin})`;
+                    }
+                }
+                catch {
+                    agentSource = `agent list unreadable, kept ${currentAgent ? "current" : "default"}`;
+                }
+            }
+            const postedGoal = stripSelectionFlags(prompt);
             const sessionReference = `Continuing work from session ${context.sessionID}. When you lack specific information you can use read_session to get it. ` +
                 `Confirm direction before acting on anything destructive.`;
             const refs = new Set(files);
-            for (const ref of parseFileReferences(prompt))
+            for (const ref of parseFileReferences(postedGoal))
                 refs.add(ref);
             const fileSections = quick ? [] : await buildFileSections(directory, refs);
             const namedFiles = quick && refs.size > 0 ? [...refs].map((ref) => `- ${ref}`) : [];
             let findingsRef = explicitFindings;
             if (findingsRef === undefined) {
-                findingsRef = await resolveSessionFindings((await ctx.session.context({ sessionID: context.sessionID })));
+                findingsRef = await resolveSessionFindings(sessionMessages);
             }
             const findingsSections = [];
             const findingsNamedOnly = [];
@@ -139,7 +386,7 @@ export function makeHandoffSession(ctx) {
             }
             const workingTree = quick ? undefined : await collectWorkingTree(directory);
             const blocks = [sessionReference];
-            blocks.push(prompt);
+            blocks.push(postedGoal);
             if (findingsSections.length > 0) {
                 blocks.push(`## Session findings (${FINDINGS_ROOT})`, ...findingsSections);
             }
@@ -178,7 +425,7 @@ export function makeHandoffSession(ctx) {
                 biggest.splice(longestIndex, 1);
                 fullPrompt = [
                     sessionReference,
-                    prompt,
+                    postedGoal,
                     ...(findingsSections.length > 0 ? [`## Session findings (${FINDINGS_ROOT})`, ...findingsSections] : []),
                     ...(findingsNamedOnly.length > 0 ? ["## Large findings files (name only)", ...findingsNamedOnly] : []),
                     ...(workingTree !== undefined ? [workingTree] : []),
@@ -186,15 +433,41 @@ export function makeHandoffSession(ctx) {
                     ...(quick && namedFiles.length > 0 ? ["## Named files (content omitted in quick mode — read directly)", ...namedFiles] : []),
                 ].join("\n\n");
             }
-            const created = await ctx.session.create({});
+            const created = await ctx.session.create({
+                ...(agent !== undefined ? { agent } : {}),
+                ...(model !== undefined ? { model } : {}),
+            });
             const sessionID = created.id;
             if (typeof sessionID !== "string" || sessionID.length === 0) {
                 return { content: "Handoff failed: session.create returned no session id." };
             }
+            // The create-time pair is honored by the current API, but adapters
+            // may drop fields they do not know — verify and repair with the
+            // dedicated switches (proven independent: neither resets the other).
+            try {
+                const fresh = (await ctx.session.get({ sessionID }));
+                if (agent !== undefined && fresh?.agent !== agent) {
+                    await ctx.session.switchAgent({ sessionID, agent });
+                }
+                if (model !== undefined &&
+                    (fresh?.model?.providerID !== model.providerID || fresh?.model?.id !== model.id)) {
+                    await ctx.session.switchModel({ sessionID, model });
+                }
+            }
+            catch {
+                // Verification is best-effort; the posted prompt is the handoff.
+            }
             await ctx.session.prompt({ sessionID, text: fullPrompt });
+            // The captured goal has served its purpose: drop it, so a later direct
+            // call in this session does not inherit a stale flag.
+            if (cached !== undefined)
+                clearGoal(context.sessionID);
+            const modelNote = model ? `${model.providerID}/${model.id} (${modelSource})` : "server default";
+            const agentNote = agent ? `${agent} (${agentSource})` : "server default";
             return {
                 content: `Handoff posted to new session ${sessionID} ` +
-                    `(${files.length} file(s)` + (findingsCount > 0 ? `, session findings attached` : `, no findings listed in session`) + `). ` +
+                    `(${files.length} file(s)` + (findingsCount > 0 ? `, session findings attached` : `, no findings listed in session`) + `, ` +
+                    `model ${modelNote}, agent ${agentNote}). ` +
                     `Continue there; this session is unchanged.`,
             };
         },
@@ -213,10 +486,11 @@ export function makeReadSession(ctx) {
             if (typeof input.sessionID !== "string" || input.sessionID.length === 0) {
                 return { content: "read_session requires a sessionID string." };
             }
-            const limit = Math.min(typeof input.limit === "number" ? input.limit : 100, 500);
+            const limit = Math.max(1, Math.min(typeof input.limit === "number" ? input.limit : 100, 500));
+            const offset = typeof input.offset === "number" && Number.isFinite(input.offset) ? input.offset : 0;
             try {
                 const messages = (await ctx.session.context({ sessionID: input.sessionID }));
-                return { content: formatTranscript(messages, limit) };
+                return { content: formatTranscript(messages, limit, offset) };
             }
             catch (error) {
                 return {

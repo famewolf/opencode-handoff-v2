@@ -15,32 +15,65 @@ interface HandoffSessionInput {
     files?: unknown;
     mode?: unknown;
     findings?: unknown;
+    model?: unknown;
+    agent?: unknown;
 }
 interface ReadSessionInput {
     sessionID?: unknown;
     limit?: unknown;
+    offset?: unknown;
 }
+export declare function resolveModelFragment(fragment: string, models: Array<{
+    id?: unknown;
+    name?: unknown;
+    providerID?: unknown;
+}>): {
+    providerID: string;
+    id: string;
+} | undefined;
+/**
+ * Resolve an agent fragment to the agent's runtime key.
+ *
+ * The server keys agents by ID (`Agent.ID.make(id)`, `agents.get(id)` in
+ * core/src/agent.ts) and a session carrying a non-key throws
+ * `AgentNotFoundError` when it loads its context (core/src/session/context.ts).
+ * The catalogue exposes both: `id` is the key ("build"), `name` is the display
+ * name ("Build"). So the display name may be MATCHED — users type either — but
+ * the ID is what gets returned and what the session is created with.
+ */
+export declare function resolveAgentFragment(fragment: string, agents: Array<{
+    id?: unknown;
+    name?: unknown;
+}>): string | undefined;
 export declare const handoffSessionInputSchema: {
     readonly type: "object";
     readonly properties: {
         readonly prompt: {
-            readonly type: "string";
             readonly description: "The generated handoff prompt";
+            readonly type: "string";
         };
         readonly files: {
+            readonly description: "Array of file paths to load into the new session's context";
             readonly type: "array";
             readonly items: {
                 readonly type: "string";
             };
-            readonly description: "Array of file paths to load into the new session's context";
         };
         readonly mode: {
-            readonly type: "string";
             readonly description: "quick: summary plus findings only, no file sections. full: everything (default)";
+            readonly type: "string";
         };
         readonly findings: {
-            readonly type: "string";
             readonly description: "Explicit findings file ref, overriding the most-recently-mentioned one";
+            readonly type: "string";
+        };
+        readonly model: {
+            readonly description: "Model for the new session (id, display name, or provider/id). Used when the handoff goal carries no --model flag; the goal always wins over this argument.";
+            readonly type: "string";
+        };
+        readonly agent: {
+            readonly description: "Agent for the new session. Used when the handoff goal carries no --agent flag; the goal always wins over this argument.";
+            readonly type: "string";
         };
     };
     readonly required: readonly ["prompt"];
@@ -49,12 +82,16 @@ export declare const readSessionInputSchema: {
     readonly type: "object";
     readonly properties: {
         readonly sessionID: {
-            readonly type: "string";
             readonly description: "The full session ID (e.g., ses_xxxxxxxxxxxxxxxx)";
+            readonly type: "string";
         };
         readonly limit: {
             readonly type: "number";
             readonly description: "Maximum number of messages to read (defaults to 100, max 500)";
+        };
+        readonly offset: {
+            readonly type: "number";
+            readonly description: "Messages to skip back from the NEWEST before reading (0 = default, reads the tail). Raise it to page toward the START of a long session — e.g. offset:100 reads the 100-to-125-newest window. Clamps at the start of history rather than returning nothing.";
         };
     };
     readonly required: readonly ["sessionID"];
@@ -71,23 +108,31 @@ export declare function makeHandoffSession(ctx: Context): {
         readonly type: "object";
         readonly properties: {
             readonly prompt: {
-                readonly type: "string";
                 readonly description: "The generated handoff prompt";
+                readonly type: "string";
             };
             readonly files: {
+                readonly description: "Array of file paths to load into the new session's context";
                 readonly type: "array";
                 readonly items: {
                     readonly type: "string";
                 };
-                readonly description: "Array of file paths to load into the new session's context";
             };
             readonly mode: {
-                readonly type: "string";
                 readonly description: "quick: summary plus findings only, no file sections. full: everything (default)";
+                readonly type: "string";
             };
             readonly findings: {
-                readonly type: "string";
                 readonly description: "Explicit findings file ref, overriding the most-recently-mentioned one";
+                readonly type: "string";
+            };
+            readonly model: {
+                readonly description: "Model for the new session (id, display name, or provider/id). Used when the handoff goal carries no --model flag; the goal always wins over this argument.";
+                readonly type: "string";
+            };
+            readonly agent: {
+                readonly description: "Agent for the new session. Used when the handoff goal carries no --agent flag; the goal always wins over this argument.";
+                readonly type: "string";
             };
         };
         readonly required: readonly ["prompt"];
@@ -109,12 +154,16 @@ export declare function makeReadSession(ctx: Context): {
         readonly type: "object";
         readonly properties: {
             readonly sessionID: {
-                readonly type: "string";
                 readonly description: "The full session ID (e.g., ses_xxxxxxxxxxxxxxxx)";
+                readonly type: "string";
             };
             readonly limit: {
                 readonly type: "number";
                 readonly description: "Maximum number of messages to read (defaults to 100, max 500)";
+            };
+            readonly offset: {
+                readonly type: "number";
+                readonly description: "Messages to skip back from the NEWEST before reading (0 = default, reads the tail). Raise it to page toward the START of a long session — e.g. offset:100 reads the 100-to-125-newest window. Clamps at the start of history rather than returning nothing.";
             };
         };
         readonly required: readonly ["sessionID"];

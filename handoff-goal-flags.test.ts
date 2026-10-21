@@ -63,7 +63,19 @@ function makeHarness(options: { shape?: "v2" | "v1" } = {}) {
 			},
 		},
 		model: { list: async () => ({ location: LOCATION, data: CATALOG }) },
-		agent: { list: async () => ({ location: LOCATION, data: [{ name: "build" }, { name: "worker" }] }) },
+		agent: {
+			list: async () => ({
+				location: LOCATION,
+				// Live shape: the server keys agents by id and carries a display
+				// name beside it ("build" -> "Build"). A session created with
+				// the display name raises AgentNotFoundError, so the id is what
+				// the tool must send.
+				data: [
+					{ id: "build", name: "Build" },
+					{ id: "worker", name: "worker" },
+				],
+			}),
+		},
 		session: {
 			get: async () => ({ agent: "build", model: { providerID: "opencode", id: "beam-free" } }),
 			context: async () => contextMessages,
@@ -170,6 +182,30 @@ describe("--model/--agent survive the model's rewrite of the handoff prompt", ()
 	test("without any flag the new session still inherits the running model", async () => {
 		const { created } = await runHandoff({ goal: "continue the port", prompt: "continue the port" })
 		expect(created?.model).toEqual({ providerID: "opencode", id: "beam-free" })
+		expect(created?.agent).toBe("build")
+	})
+
+	test("an agent display name resolves to the agent's id", async () => {
+		const { created } = await runHandoff({
+			goal: "continue the port --agent Build",
+			prompt: "continue the port",
+		})
+		expect(created?.agent).toBe("build")
+	})
+
+	test("an agent id resolves to itself, not to a display name", async () => {
+		const { created } = await runHandoff({
+			goal: "continue the port --agent build",
+			prompt: "continue the port",
+		})
+		expect(created?.agent).toBe("build")
+	})
+
+	test("an agent the catalogue does not know keeps the running agent", async () => {
+		const { created } = await runHandoff({
+			goal: "continue the port --agent nope-xyz",
+			prompt: "continue the port",
+		})
 		expect(created?.agent).toBe("build")
 	})
 
